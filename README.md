@@ -283,7 +283,7 @@ The report should be at most 3 pages. Besides the experiments and answers, inclu
 
 ## Submission requirements
 - `submission/wrr.patch`, made with `make patch`. It contains all of your changes since the starter code, committed or not, and `make patch` checks that it applies to the starter code. Run `make test` once more just before you make it: graders apply the patch to the starter code and run the same tests.
-- Your report, as a PDF.
+- Your report, as an MD file.
 
 ### Grading
 | Part | Points |
