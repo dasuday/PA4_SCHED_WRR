@@ -1,0 +1,665 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 7e8d46f..893755f 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -383,6 +383,8 @@
+ 459	common	lsm_get_self_attr	sys_lsm_get_self_attr
+ 460	common	lsm_set_self_attr	sys_lsm_set_self_attr
+ 461	common	lsm_list_modules	sys_lsm_list_modules
++462	common	sched_setweight		sys_sched_setweight
++463	common	sched_getweight		sys_sched_getweight
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 5dd3a61..fddbc84 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -130,6 +130,7 @@
+ 	*(__stop_sched_class)			\
+ 	*(__dl_sched_class)			\
+ 	*(__rt_sched_class)			\
++	*(__wrr_sched_class)			\
+ 	*(__fair_sched_class)			\
+ 	*(__idle_sched_class)			\
+ 	__sched_class_lowest = .;
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ffe8f61..8cafbf7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -592,6 +592,25 @@ struct sched_rt_entity {
+ #endif
+ } __randomize_layout;
+ 
++/*
++ * SCHED_WRR (weighted round-robin) per-task state. See kernel/sched/wrr.c.
++ *
++ * A task of weight w runs for WRR_TIMESLICE(w) ticks (w * 10 ms) each time
++ * it reaches the head of its CPU's queue.
++ */
++#define WRR_MIN_WEIGHT		1
++#define WRR_DEFAULT_WEIGHT	1
++#define WRR_MAX_WEIGHT		20
++#define WRR_BASE_SLICE_MS	10
++#define WRR_TIMESLICE(w)	((w) * WRR_BASE_SLICE_MS * HZ / 1000)
++
++struct sched_wrr_entity {
++	struct list_head		run_list;	/* node in rq->wrr.queue */
++	unsigned int			weight;		/* WRR_MIN_WEIGHT..WRR_MAX_WEIGHT */
++	unsigned int			time_slice;	/* ticks left in this turn */
++	unsigned short			on_rq;		/* 1 while on rq->wrr.queue */
++};
++
+ typedef bool (*dl_server_has_tasks_f)(struct sched_dl_entity *);
+ typedef struct task_struct *(*dl_server_pick_f)(struct sched_dl_entity *);
+ 
+@@ -796,6 +815,7 @@ struct task_struct {
+ 
+ 	struct sched_entity		se;
+ 	struct sched_rt_entity		rt;
++	struct sched_wrr_entity		wrr;
+ 	struct sched_dl_entity		dl;
+ 	struct sched_dl_entity		*dl_server;
+ 	const struct sched_class	*sched_class;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index e619ac1..3acecf3 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -633,6 +633,8 @@ asmlinkage long sys_sched_getaffinity(pid_t pid, unsigned int len,
+ asmlinkage long sys_sched_yield(void);
+ asmlinkage long sys_sched_get_priority_max(int policy);
+ asmlinkage long sys_sched_get_priority_min(int policy);
++asmlinkage long sys_sched_setweight(pid_t pid, int weight);
++asmlinkage long sys_sched_getweight(pid_t pid);
+ asmlinkage long sys_sched_rr_get_interval(pid_t pid,
+ 				struct __kernel_timespec __user *interval);
+ asmlinkage long sys_sched_rr_get_interval_time32(pid_t pid,
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 75f0096..2dc189c 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -841,9 +841,13 @@ __SYSCALL(__NR_lsm_get_self_attr, sys_lsm_get_self_attr)
+ __SYSCALL(__NR_lsm_set_self_attr, sys_lsm_set_self_attr)
+ #define __NR_lsm_list_modules 461
+ __SYSCALL(__NR_lsm_list_modules, sys_lsm_list_modules)
++#define __NR_sched_setweight 462
++__SYSCALL(__NR_sched_setweight, sys_sched_setweight)
++#define __NR_sched_getweight 463
++__SYSCALL(__NR_sched_getweight, sys_sched_getweight)
+ 
+ #undef __NR_syscalls
+-#define __NR_syscalls 462
++#define __NR_syscalls 464
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/include/uapi/linux/sched.h b/include/uapi/linux/sched.h
+index 3bac0a8..a3a1b11 100644
+--- a/include/uapi/linux/sched.h
++++ b/include/uapi/linux/sched.h
+@@ -118,6 +118,7 @@ struct clone_args {
+ /* SCHED_ISO: reserved but not implemented yet */
+ #define SCHED_IDLE		5
+ #define SCHED_DEADLINE		6
++#define SCHED_WRR		7	/* CSPB 3753: weighted round-robin */
+ 
+ /* Can be ORed in to make sure the process is reverted back to SCHED_NORMAL on fork */
+ #define SCHED_RESET_ON_FORK     0x40000000
+diff --git a/init/init_task.c b/init/init_task.c
+index 7ecb458..b6b4089 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -91,6 +91,11 @@ struct task_struct init_task __aligned(L1_CACHE_BYTES) = {
+ 		.run_list	= LIST_HEAD_INIT(init_task.rt.run_list),
+ 		.time_slice	= RR_TIMESLICE,
+ 	},
++	.wrr		= {
++		.run_list	= LIST_HEAD_INIT(init_task.wrr.run_list),
++		.weight		= WRR_DEFAULT_WEIGHT,
++		.time_slice	= WRR_TIMESLICE(WRR_DEFAULT_WEIGHT),
++	},
+ 	.tasks		= LIST_HEAD_INIT(init_task.tasks),
+ #ifdef CONFIG_SMP
+ 	.pushable_tasks	= PLIST_NODE_INIT(init_task.pushable_tasks, MAX_PRIO),
+diff --git a/kernel/sched/build_policy.c b/kernel/sched/build_policy.c
+index d9dc9ab..e8a62a7 100644
+--- a/kernel/sched/build_policy.c
++++ b/kernel/sched/build_policy.c
+@@ -43,6 +43,7 @@
+ #include "idle.c"
+ 
+ #include "rt.c"
++#include "wrr.c"
+ 
+ #ifdef CONFIG_SMP
+ # include "cpudeadline.c"
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index d3aef62..e241254 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -165,6 +165,9 @@ static inline int __task_prio(const struct task_struct *p)
+ 	if (rt_prio(p->prio)) /* includes deadline */
+ 		return p->prio; /* [-1, 99] */
+ 
++	if (p->sched_class == &wrr_sched_class)
++		return MAX_RT_PRIO; /* 100: below RT, above fair */
++
+ 	if (p->sched_class == &idle_sched_class)
+ 		return MAX_RT_PRIO + NICE_WIDTH; /* 140 */
+ 
+@@ -4544,6 +4547,11 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	p->rt.on_rq		= 0;
+ 	p->rt.on_list		= 0;
+ 
++	/* The weight is inherited from the parent (copied with the task_struct). */
++	INIT_LIST_HEAD(&p->wrr.run_list);
++	p->wrr.on_rq		= 0;
++	p->wrr.time_slice	= WRR_TIMESLICE(p->wrr.weight);
++
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	INIT_HLIST_HEAD(&p->preempt_notifiers);
+ #endif
+@@ -4766,6 +4774,12 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 	 * Revert to default priority/policy on fork if requested.
+ 	 */
+ 	if (unlikely(p->sched_reset_on_fork)) {
++		/*
++		 * TODO(WRR Part A.1): a SCHED_WRR parent with SCHED_RESET_ON_FORK
++		 * set must produce a SCHED_NORMAL child whose WRR weight is
++		 * WRR_DEFAULT_WEIGHT. Extend the policy test below and reset
++		 * p->wrr.weight.
++		 */
+ 		if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
+ 			p->policy = SCHED_NORMAL;
+ 			p->static_prio = NICE_TO_PRIO(0);
+@@ -4783,6 +4797,10 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
+ 		p->sched_reset_on_fork = 0;
+ 	}
+ 
++	/*
++	 * TODO(WRR Part A.2): a child whose policy is SCHED_WRR (and that
++	 * is not RT-boosted) must start in wrr_sched_class.
++	 */
+ 	if (dl_prio(p->prio))
+ 		return -EAGAIN;
+ 	else if (rt_prio(p->prio))
+@@ -7062,6 +7080,12 @@ EXPORT_SYMBOL(default_wake_function);
+ 
+ static void __setscheduler_prio(struct task_struct *p, int prio)
+ {
++	/*
++	 * TODO(WRR Part A.3): this decides which class a task belongs to
++	 * after sched_setscheduler() and after priority inheritance.
++	 * A SCHED_WRR task belongs in wrr_sched_class unless @prio says it
++	 * is (temporarily) deadline or RT.
++	 */
+ 	if (dl_prio(prio))
+ 		p->sched_class = &dl_sched_class;
+ 	else if (rt_prio(prio))
+@@ -7271,9 +7295,10 @@ void set_user_nice(struct task_struct *p, long nice)
+ 	 * The RT priorities are set via sched_setscheduler(), but we still
+ 	 * allow the 'normal' nice value to be set - but as expected
+ 	 * it won't have any effect on scheduling until the task is
+-	 * SCHED_DEADLINE, SCHED_FIFO or SCHED_RR:
++	 * SCHED_DEADLINE, SCHED_FIFO or SCHED_RR (or SCHED_WRR):
+ 	 */
+-	if (task_has_dl_policy(p) || task_has_rt_policy(p)) {
++	if (task_has_dl_policy(p) || task_has_rt_policy(p) ||
++	    task_has_wrr_policy(p)) {
+ 		p->static_prio = NICE_TO_PRIO(nice);
+ 		return;
+ 	}
+@@ -7654,6 +7679,10 @@ static int user_check_sched_setscheduler(struct task_struct *p,
+ 	if (dl_policy(policy))
+ 		goto req_priv;
+ 
++	/* SCHED_WRR runs ahead of every CFS task: joining it is privileged. */
++	if (wrr_policy(policy) && policy != p->policy)
++		goto req_priv;
++
+ 	/*
+ 	 * Treat SCHED_IDLE as nice 20. Only allow a switch to
+ 	 * SCHED_NORMAL if the RLIMIT_NICE would normally permit it.
+@@ -9046,6 +9075,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
++	case SCHED_WRR:
+ 		ret = 0;
+ 		break;
+ 	}
+@@ -9073,6 +9103,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
+ 	case SCHED_NORMAL:
+ 	case SCHED_BATCH:
+ 	case SCHED_IDLE:
++	case SCHED_WRR:
+ 		ret = 0;
+ 	}
+ 	return ret;
+@@ -9904,7 +9935,8 @@ void __init sched_init(void)
+ 
+ 	/* Make sure the linker didn't screw up */
+ 	BUG_ON(&idle_sched_class != &fair_sched_class + 1 ||
+-	       &fair_sched_class != &rt_sched_class + 1 ||
++	       &fair_sched_class != &wrr_sched_class + 1 ||
++	       &wrr_sched_class  != &rt_sched_class + 1 ||
+ 	       &rt_sched_class   != &dl_sched_class + 1);
+ #ifdef CONFIG_SMP
+ 	BUG_ON(&dl_sched_class != &stop_sched_class + 1);
+@@ -9971,6 +10003,7 @@ void __init sched_init(void)
+ 		rq->calc_load_update = jiffies + LOAD_FREQ;
+ 		init_cfs_rq(&rq->cfs);
+ 		init_rt_rq(&rq->rt);
++		init_wrr_rq(&rq->wrr);
+ 		init_dl_rq(&rq->dl);
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ 		INIT_LIST_HEAD(&rq->leaf_cfs_rq_list);
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index 8d5d98a..e25b29e 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -787,6 +787,8 @@ do {									\
+ 	SEQ_printf(m, "  .%-30s: %Ld.%06ld\n", #x, SPLIT_NS(rq->x))
+ 
+ 	P(nr_running);
++	P(wrr.nr_running);
++	P(wrr.total_weight);
+ 	P(nr_switches);
+ 	P(nr_uninterruptible);
+ 	PN(next_balance);
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 8c817d0..70102e6 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -187,10 +187,16 @@ static inline int dl_policy(int policy)
+ {
+ 	return policy == SCHED_DEADLINE;
+ }
++
++static inline int wrr_policy(int policy)
++{
++	return policy == SCHED_WRR;
++}
++
+ static inline bool valid_policy(int policy)
+ {
+ 	return idle_policy(policy) || fair_policy(policy) ||
+-		rt_policy(policy) || dl_policy(policy);
++		rt_policy(policy) || dl_policy(policy) || wrr_policy(policy);
+ }
+ 
+ static inline int task_has_idle_policy(struct task_struct *p)
+@@ -208,6 +214,11 @@ static inline int task_has_dl_policy(struct task_struct *p)
+ 	return dl_policy(p->policy);
+ }
+ 
++static inline int task_has_wrr_policy(struct task_struct *p)
++{
++	return wrr_policy(p->policy);
++}
++
+ #define cap_scale(v, s) ((v)*(s) >> SCHED_CAPACITY_SHIFT)
+ 
+ static inline void update_avg(u64 *avg, u64 sample)
+@@ -726,6 +737,17 @@ static inline bool rt_rq_is_runnable(struct rt_rq *rt_rq)
+ 	return rt_rq->rt_queued && rt_rq->rt_nr_running;
+ }
+ 
++/*
++ * SCHED_WRR per-CPU run queue (rq->wrr). Every runnable SCHED_WRR task on
++ * this CPU, including the one that is running, is on @queue; the head of
++ * the queue is the task that runs next.
++ */
++struct wrr_rq {
++	struct list_head	queue;
++	unsigned int		nr_running;	/* tasks on @queue */
++	unsigned long		total_weight;	/* sum of their weights */
++};
++
+ /* Deadline class' related fields in a runqueue */
+ struct dl_rq {
+ 	/* runqueue is an rbtree, ordered by deadline */
+@@ -1016,6 +1038,7 @@ struct rq {
+ 
+ 	struct cfs_rq		cfs;
+ 	struct rt_rq		rt;
++	struct wrr_rq		wrr;
+ 	struct dl_rq		dl;
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+@@ -2364,6 +2387,7 @@ extern struct sched_class __sched_class_lowest[];
+ extern const struct sched_class stop_sched_class;
+ extern const struct sched_class dl_sched_class;
+ extern const struct sched_class rt_sched_class;
++extern const struct sched_class wrr_sched_class;
+ extern const struct sched_class fair_sched_class;
+ extern const struct sched_class idle_sched_class;
+ 
+@@ -2382,6 +2406,11 @@ static inline bool sched_rt_runnable(struct rq *rq)
+ 	return rq->rt.rt_queued > 0;
+ }
+ 
++static inline bool sched_wrr_runnable(struct rq *rq)
++{
++	return rq->wrr.nr_running > 0;
++}
++
+ static inline bool sched_fair_runnable(struct rq *rq)
+ {
+ 	return rq->cfs.nr_running > 0;
+@@ -2895,6 +2924,7 @@ static inline void resched_latency_warn(int cpu, u64 latency) {}
+ 
+ extern void init_cfs_rq(struct cfs_rq *cfs_rq);
+ extern void init_rt_rq(struct rt_rq *rt_rq);
++extern void init_wrr_rq(struct wrr_rq *wrr_rq);
+ extern void init_dl_rq(struct dl_rq *dl_rq);
+ 
+ extern void cfs_bandwidth_usage_inc(void);
+diff --git a/kernel/sched/wrr.c b/kernel/sched/wrr.c
+new file mode 100644
+index 0000000..b02f003
+--- /dev/null
++++ b/kernel/sched/wrr.c
+@@ -0,0 +1,302 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * SCHED_WRR: a weighted round-robin scheduling class.
++ *
++ * CSPB 3753 scheduler assignment -- STARTER CODE.
++ *
++ * Every CPU has a FIFO queue of runnable SCHED_WRR tasks (rq->wrr.queue).
++ * The task at the head of the queue runs. A task of weight w may run for
++ * WRR_TIMESLICE(w) ticks (w * 10 ms); when that slice is used up the task
++ * moves to the tail and the next task gets its turn. When every task on a
++ * CPU is CPU-bound, a task's share of that CPU is w / (sum of weights).
++ *
++ * The class sits between RT and CFS: stop > deadline > rt > wrr > fair > idle
++ * (see SCHED_DATA in include/asm-generic/vmlinux.lds.h).
++ *
++ * Data structures (already declared for you):
++ *   struct sched_wrr_entity   p->wrr       include/linux/sched.h
++ *   struct wrr_rq             rq->wrr      kernel/sched/sched.h
++ *
++ * Locking: every method below is called with rq->lock held (interrupts
++ * off), except select_task_rq(), which holds only p->pi_lock. Never sleep,
++ * allocate memory or take a mutex in here.
++ *
++ * Search for "TODO(WRR" to find every place you need to write code.
++ * kernel/sched/rt.c (SCHED_RR) is the closest existing class: read it.
++ */
++
++#include <linux/syscalls.h>
++#include <linux/security.h>
++
++void init_wrr_rq(struct wrr_rq *wrr_rq)
++{
++	INIT_LIST_HEAD(&wrr_rq->queue);
++	wrr_rq->nr_running = 0;
++	wrr_rq->total_weight = 0;
++}
++
++/* Length of a full turn for @p, in ticks. */
++static inline unsigned int wrr_full_slice(struct task_struct *p)
++{
++	return WRR_TIMESLICE(p->wrr.weight);
++}
++
++static inline struct task_struct *wrr_task_of(struct sched_wrr_entity *wrr_se)
++{
++	return container_of(wrr_se, struct task_struct, wrr);
++}
++
++/*
++ * TODO(WRR Part B.1): charge the running task for the CPU time it used.
++ *
++ * If rq->curr is a WRR task, call update_curr_common(rq). That function
++ * adds (now - curr->se.exec_start) to curr->se.sum_exec_runtime and moves
++ * exec_start forward. It is what makes /proc, getrusage() and the
++ * per-process CPU clocks report the right numbers. Return without doing
++ * anything if rq->curr belongs to some other class.
++ */
++static void update_curr_wrr(struct rq *rq)
++{
++}
++
++/*
++ * TODO(WRR Part B.2): add @p to this CPU's WRR queue.
++ *
++ * Add it at the tail (or at the head if flags has ENQUEUE_HEAD), mark it
++ * on_rq, and keep rq->wrr.nr_running and rq->wrr.total_weight up to date.
++ * Also call add_nr_running(rq, 1) so the core knows this CPU has one more
++ * runnable task. total_weight is read without the lock by
++ * select_task_rq_wrr(), so update it with WRITE_ONCE().
++ */
++static void
++enqueue_task_wrr(struct rq *rq, struct task_struct *p, int flags)
++{
++}
++
++/*
++ * TODO(WRR Part B.2): remove @p from this CPU's WRR queue.
++ *
++ * The reverse of enqueue: charge the running task first (it may be @p,
++ * about to sleep), then unlink @p and undo every counter you changed.
++ */
++static void
++dequeue_task_wrr(struct rq *rq, struct task_struct *p, int flags)
++{
++}
++
++/*
++ * TODO(WRR Part B.5): sched_yield() -- the running task gives up the rest
++ * of its turn. Move it to the tail of the queue (the core calls schedule()
++ * for you afterwards).
++ */
++static void yield_task_wrr(struct rq *rq)
++{
++}
++
++/*
++ * A WRR task woke up (or was moved here) while another WRR task is running.
++ * Round-robin does not preempt within the class: the new task waits for its
++ * turn. (When the running task is CFS or idle the core preempts it for us,
++ * because wrr_sched_class is above them.)
++ */
++static void wakeup_preempt_wrr(struct rq *rq, struct task_struct *p, int flags)
++{
++}
++
++/*
++ * TODO(WRR Part B.3): @p is about to run. Start the clock that
++ * update_curr_wrr() charges from: p->se.exec_start = rq_clock_task(rq).
++ */
++static void set_next_task_wrr(struct rq *rq, struct task_struct *p, bool first)
++{
++}
++
++/*
++ * TODO(WRR Part B.3): return the task at the head of the queue without
++ * changing anything, or NULL if the queue is empty.
++ * Hint: list_first_entry_or_null() and wrr_task_of().
++ */
++static struct task_struct *pick_task_wrr(struct rq *rq)
++{
++	return NULL;
++}
++
++/*
++ * TODO(WRR Part B.3): like pick_task_wrr(), but the task returned will run
++ * now, so also call set_next_task_wrr(rq, p, true) on it.
++ */
++static struct task_struct *pick_next_task_wrr(struct rq *rq)
++{
++	return NULL;
++}
++
++/*
++ * TODO(WRR Part B.3): @p is being switched out. Charge it for the time it
++ * just ran. (It stays on the queue if it is still runnable.)
++ */
++static void put_prev_task_wrr(struct rq *rq, struct task_struct *p)
++{
++}
++
++/*
++ * TODO(WRR Part B.4): called from the timer tick (HZ times a second) while
++ * @p is running. This is the heart of round-robin:
++ *
++ *   1. charge @p for its CPU time;
++ *   2. use up one tick of p->wrr.time_slice;
++ *   3. when the slice runs out, refill it to a full slice and, if other
++ *      WRR tasks are waiting on this CPU, move @p to the tail of the queue
++ *      and call resched_curr(rq) so the next task runs.
++ *
++ * Careful: time_slice is unsigned. Don't let it wrap around below 0.
++ */
++static void task_tick_wrr(struct rq *rq, struct task_struct *p, int queued)
++{
++}
++
++/*
++ * TODO(WRR Part B.6): a new WRR task was just forked. It inherited its
++ * parent's weight; give it a full slice for that weight.
++ */
++static void task_fork_wrr(struct task_struct *p)
++{
++}
++
++/*
++ * TODO(WRR Part B.6): @p has just become a WRR task (sched_setscheduler(),
++ * or the end of a priority-inheritance boost). Give it a full slice. If it
++ * is queued but not running, and the running task belongs to a lower class
++ * (CFS or idle), call resched_curr(rq) so @p does not wait for the next
++ * tick. Useful: task_current(), task_on_rq_queued(), sched_class_above().
++ */
++static void switched_to_wrr(struct rq *rq, struct task_struct *p)
++{
++}
++
++static void prio_changed_wrr(struct rq *rq, struct task_struct *p, int oldprio)
++{
++	/* Priorities do not order WRR tasks; only weights matter. */
++}
++
++/*
++ * TODO(WRR Part B.6): sched_rr_get_interval() reports this value. Return
++ * the length of a full turn for @p, in jiffies (ticks).
++ */
++static unsigned int get_rr_interval_wrr(struct rq *rq, struct task_struct *p)
++{
++	return 0;
++}
++
++#ifdef CONFIG_SMP
++/*
++ * Given to you. Called before put_prev_task() for every class from the
++ * previous task's class down. Returning true stops the walk: a task of this
++ * class or a higher one is runnable, so lower classes (CFS) need not go and
++ * look for work on other CPUs.
++ */
++static int balance_wrr(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
++{
++	return sched_stop_runnable(rq) || sched_dl_runnable(rq) ||
++	       sched_rt_runnable(rq) || sched_wrr_runnable(rq);
++}
++
++/*
++ * TODO(WRR Part B.7): choose a CPU for @p when it is created (WF_FORK),
++ * wakes up (WF_TTWU) or calls exec (WF_EXEC). @cpu is the CPU it last ran
++ * on.
++ *
++ * Return the CPU with the smallest rq->wrr.total_weight among the CPUs
++ * that @p may use (p->cpus_ptr) and that are active (cpu_active_mask);
++ * see for_each_cpu_and(). Break ties in favour of @cpu. If @p is still
++ * queued on its current CPU (the WF_EXEC case), don't count its own weight
++ * against that CPU.
++ *
++ * Only p->pi_lock is held, so read other CPUs' totals with READ_ONCE()
++ * and never take their rq locks here. If no CPU qualifies, return @cpu
++ * and the core will pick a fallback.
++ */
++static int select_task_rq_wrr(struct task_struct *p, int cpu, int flags)
++{
++	return cpu;
++}
++#endif /* CONFIG_SMP */
++
++DEFINE_SCHED_CLASS(wrr) = {
++	.enqueue_task		= enqueue_task_wrr,
++	.dequeue_task		= dequeue_task_wrr,
++	.yield_task		= yield_task_wrr,
++
++	.wakeup_preempt		= wakeup_preempt_wrr,
++
++	.pick_next_task		= pick_next_task_wrr,
++	.put_prev_task		= put_prev_task_wrr,
++	.set_next_task		= set_next_task_wrr,
++
++#ifdef CONFIG_SMP
++	.balance		= balance_wrr,
++	.pick_task		= pick_task_wrr,
++	.select_task_rq		= select_task_rq_wrr,
++	.set_cpus_allowed	= set_cpus_allowed_common,
++#endif
++
++	.task_tick		= task_tick_wrr,
++	.task_fork		= task_fork_wrr,
++
++	.switched_to		= switched_to_wrr,
++	.prio_changed		= prio_changed_wrr,
++
++	.get_rr_interval	= get_rr_interval_wrr,
++
++	.update_curr		= update_curr_wrr,
++};
++
++/* ------------------------------------------------------------------------
++ * TODO(WRR Part C): system calls
++ *
++ *   long sched_setweight(pid_t pid, int weight);   x86_64 / arm64: 462
++ *   long sched_getweight(pid_t pid);               x86_64 / arm64: 463
++ *
++ * pid 0 means the calling thread. The syscall tables already point at these
++ * two functions; you only write the bodies. See the README for the full
++ * specification. In short:
++ *
++ * sched_getweight(pid)
++ *   returns the weight of @pid;
++ *   -EINVAL if pid < 0 or the task's policy is not SCHED_WRR;
++ *   -ESRCH  if there is no such task.
++ *
++ * sched_setweight(pid, weight)
++ *   sets the weight of @pid and returns 0;
++ *   -EINVAL if pid < 0, weight is outside WRR_MIN_WEIGHT..WRR_MAX_WEIGHT,
++ *           or the task's policy is not SCHED_WRR;
++ *   -ESRCH  if there is no such task;
++ *   -EPERM  if the caller lacks CAP_SYS_NICE and either does not own the
++ *           task (its euid matches neither the task's uid nor its euid) or
++ *           is trying to raise the weight. Lowering your own task's weight
++ *           is always allowed.
++ *   If the task is queued, rq->wrr.total_weight must change with it. The
++ *   new weight applies from the task's next turn: if the rest of the current
++ *   turn is longer than a full slice at the new weight, cut it to that.
++ *
++ * Hints:
++ *   - Look the task up under rcu_read_lock() with find_task_by_vpid() and
++ *     pin it with get_task_struct() / put_task_struct().
++ *   - task_rq_lock(p, &rf) / task_rq_unlock(rq, p, &rf) take p->pi_lock and
++ *     the task's rq->lock, so neither its policy nor its queue can change
++ *     while you hold them. Check the policy *under* that lock.
++ *   - Credentials: current_cred(), __task_cred(p) (under RCU), uid_eq(),
++ *     capable(CAP_SYS_NICE). Finish the permission check with
++ *     security_task_setscheduler(p) and return its error, if any.
++ *   - Check permissions before taking task_rq_lock(): capable() and the LSM
++ *     hook are not safe to call with a spinlock held and interrupts off.
++ */
++
++SYSCALL_DEFINE2(sched_setweight, pid_t, pid, int, weight)
++{
++	return -ENOSYS;
++}
++
++SYSCALL_DEFINE1(sched_getweight, pid_t, pid)
++{
++	return -ENOSYS;
++}

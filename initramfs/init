@@ -1,0 +1,67 @@
+#!/bin/busybox sh
+# /init for the SCHED_WRR test VM (busybox + the static programs in user/).
+#
+# Kernel command-line options (unknown key=value options reach us as
+# environment variables):
+#   wrrtest=all | wrrtest=name1,name2   run the tests, then power off
+#   wrrseed=N                           seed for the stress test
+# Without wrrtest=, you get an interactive shell; type `poweroff` to leave.
+
+/bin/busybox --install -s /bin
+export PATH=/bin
+mkdir -p /proc /sys /dev /tmp /root /etc
+
+# QEMU runs with -no-reboot, so rebooting ends the VM. The login shell
+# reads /etc/profile, which makes poweroff, halt and reboot do just that.
+# (Shell functions, because busybox's shell runs its own applets in
+# preference to anything in $PATH.)
+cat > /etc/profile <<'EOF'
+export PATH=/bin
+poweroff() { sync; busybox reboot -f; }
+halt() { poweroff; }
+reboot() { poweroff; }
+EOF
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+hostname wrr-vm
+echo "root:x:0:0:root:/root:/bin/sh" > /etc/passwd
+echo "nobody:x:65534:65534:nobody:/:/bin/false" >> /etc/passwd
+echo "root:x:0:" > /etc/group
+
+# Console shows kernel warnings and worse (WARN, BUG, oops), not chatter.
+echo 5 > /proc/sys/kernel/printk 2>/dev/null
+
+cat <<'EOF'
+
+  SCHED_WRR test VM -- CSPB 3753
+  Programs: wrr-test, wrr-run, wrr-weight, spin, wrr-share, wrr-latency
+  CPU 0 runs this shell. Put WRR tasks on CPUs 1-3 (e.g. wrr-run -c 1 ...).
+  Leave with: poweroff   (or Ctrl-A then X)
+
+EOF
+uname -a
+echo "CPUs online: $(grep -c ^processor /proc/cpuinfo)"
+
+if [ -n "$wrrseed" ]; then
+	export WRR_SEED="$wrrseed"
+fi
+
+if [ -n "$wrrtest" ]; then
+	if [ "$wrrtest" = all ]; then
+		/bin/wrr-test
+	else
+		/bin/wrr-test $(echo "$wrrtest" | tr ',' ' ')
+	fi
+	echo "WRR-VM-DONE"
+	sync
+	reboot -f
+fi
+
+# Interactive: a shell with job control on the serial console.
+while true; do
+	setsid cttyhack sh -l
+	echo "Shell exited; powering off."
+	reboot -f
+done
